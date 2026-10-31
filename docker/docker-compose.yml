@@ -1,0 +1,26 @@
+name: agent-triage
+
+services:
+  agent-triage:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: agent-triage
+    hostname: agent-triage
+    # 메모리 한도를 걸어두면 실습이 호스트까지 번지지 않는다.
+    # 과제의 MEMORY_LIMIT(최대 512MB)보다 넉넉히 준다.
+    mem_limit: 1g
+    cpus: 2
+    # 포트를 호스트로 내보내지 않는다.
+    # 앱은 컨테이너 안에서만 15034 에 바인딩하면 되고,
+    # 다른 실습 컨테이너(agent-ops)와 포트가 충돌하지 않는다.
+    restart: unless-stopped
+    # init: true 는 PID 1 로 tini(작은 init 프로세스)를 넣는다.
+    #
+    # 왜 필요한가: 리눅스에서 부모가 먼저 죽으면 자식은 PID 1 에 입양된다.
+    # PID 1 은 입양한 자식이 끝날 때 wait() 로 '거둬들일(reap)' 책임이 있다.
+    # 그런데 sleep infinity 는 wait() 를 호출하지 않으므로, 종료된 프로세스가
+    # 프로세스 테이블에서 사라지지 못하고 **좀비(<defunct>)로 쌓인다.**
+    # 실습에서 앱을 수십 번 죽이다 보면 ps 출력이 좀비로 뒤덮여
+    # 정작 봐야 할 프로세스가 묻힌다. tini 는 이걸 자동으로 처리한다.
+    init: true
