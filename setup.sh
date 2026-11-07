@@ -33,7 +33,7 @@ export CPU_MAX_OCCUPY=\${CPU_MAX_OCCUPY:-20}
 export MULTI_THREAD_ENABLE=\${MULTI_THREAD_ENABLE:-true}
 # 관제 대상 프로세스 이름.
 # 실제 제공 바이너리를 쓸 때는 agent-app-leak-arm64 등으로 바꾼다.
-export AGENT_PROC=\${AGENT_PROC:-fault_sim.py}
+export AGENT_PROC=\${AGENT_PROC:-agent-leak-app-arm64}
 ENV
 chmod 644 /etc/profile.d/agent-triage.sh
 # shellcheck disable=SC1091
@@ -44,9 +44,28 @@ for n in AGENT_HOME AGENT_PORT AGENT_UPLOAD_DIR AGENT_KEY_PATH AGENT_LOG_DIR \
 done
 
 echo
+echo "== 시간대 =="
+# Dockerfile 의 ENV TZ 만으로는 `su - agent` 로그인 셸에 반영되지 않아
+# 로그 타임스탬프가 UTC 로 찍혔다(2026-11-07 실측). /etc/localtime 을 직접 걸어둔다.
+if [ -f /usr/share/zoneinfo/Asia/Seoul ]; then
+    ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime
+    echo "Asia/Seoul" > /etc/timezone
+fi
+date
+
+echo
 echo "== 스크립트/앱 배치 =="
 cp /opt/agent-triage/bin/*.sh "$AGENT_HOME/bin/"
 cp /opt/agent-triage/sim/fault_sim.py "$AGENT_HOME/"
+# 코디세이 제공 바이너리. 저장소에 포함하지 않으므로(공개 저장소 + 과정 자료
+# 재배포 금지) 있으면 쓰고, 없으면 fault_sim.py 로 떨어뜨린다.
+if [ -f /opt/agent-triage/app/agent-leak-app-arm64 ]; then
+    cp /opt/agent-triage/app/agent-leak-app-arm64 "$AGENT_HOME/"
+    chmod 750 "$AGENT_HOME/agent-leak-app-arm64"
+else
+    echo "  ⚠️ agent-leak-app-arm64 없음 → AGENT_PROC 을 fault_sim.py 로 되돌립니다"
+    sed -i "s|AGENT_PROC:-agent-leak-app-arm64|AGENT_PROC:-fault_sim.py|" /etc/profile.d/agent-triage.sh
+fi
 chown -R "$USER_NAME:$USER_NAME" "$AGENT_HOME"
 chmod 750 "$AGENT_HOME"/bin/*.sh
 chmod 750 "$AGENT_HOME/fault_sim.py"

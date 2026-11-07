@@ -66,6 +66,47 @@ find_target_pid() {
     return 1
 }
 
+# ── 프로세스 트리 전체를 재는 이유 (2026-11-07 실측으로 추가) ──────────────
+# 제공 바이너리 agent-leak-app-arm64 는 부모가 포트만 열어두고 실제 작업은
+# **워커 자식 프로세스**에게 맡긴다. 그래서 부모만 재면 누수가 한창일 때도
+# CPU 0.0% / MEM 0.0% 로 찍힌다.
+#   실측: 부모 PID 140 은 끝까지 MEM 0.0% — 워커 142 가 275MB 까지 쌓고 자진 종료.
+# 관제 도구가 "앱이 멀쩡하다"고 거짓 보고하면 쓸모가 없으므로,
+# 보고 PID 는 부모로 고정하고 수치는 **자손까지 합산**한다.
+# ⚠️ 방문 기록(seen)이 반드시 있어야 한다.
+#   children 은 '스레드마다' 파일이 따로 있어서(/proc/PID/task/TID/children)
+#   같은 자식이 여러 번 잡힌다. 중복을 그대로 큐에 넣으면 같은 PID 를 계속
+#   다시 펼쳐서 큐가 끝없이 불어난다 — 2026-11-07 에 앱이 죽지 않는 설정
+#   (MEMORY_LIMIT=512)에서 샘플 한 번이 끝나지 않아 관제가 멈췄다.
+# 안전장치로 탐색 개수 상한(MAX_TREE_PIDS)도 둔다.
+MAX_TREE_PIDS=256
+tree_pids() {
+    local queue=("$1") cur kid count=0
+    local -A seen=()
+    seen["$1"]=1
+    while (( ${#queue[@]} > 0 )); do
+        cur="${queue[0]}"; queue=("${queue[@]:1}")
+        printf '%s\n' "$cur"
+        (( ++count >= MAX_TREE_PIDS )) && return 0
+        for kid in $(cat /proc/"$cur"/task/*/children 2>/dev/null); do
+            [[ -n "${seen[$kid]:-}" ]] && continue
+            seen["$kid"]=1
+            queue+=("$kid")
+        done
+    done
+}
+
+tree_mem_percent() {
+    local total rss=0 p v
+    total="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+    for p in $(tree_pids "$1"); do
+        v="$(awk '/^VmRSS:/ { print $2 }' "/proc/$p/status" 2>/dev/null)"
+        [[ -n "$v" ]] && rss=$(( rss + v ))
+    done
+    awk -v r="$rss" -v t="$total" \
+        'BEGIN { if (t <= 0) { print "0.0"; exit } printf "%.1f", r * 100 / t }'
+}
+
 sample_once() {
     local pid cpu mem disk fw now
     pid="$(find_target_pid)"
@@ -81,8 +122,8 @@ sample_once() {
     # ps 의 %cpu 는 '프로세스 수명 전체의 평균'이라 급상승 구간을 못 잡는다.
     # 그래서 /proc/<pid>/stat 을 1초 간격으로 두 번 읽어 그 사이의 사용률을 직접 센다.
     cpu="$(proc_cpu_percent "$pid")"
-    # %mem 은 전체 물리 메모리 대비 RSS 비율이다. 누수 추적에는 이 값이면 충분하다.
-    mem="$(ps -p "$pid" -o %mem= 2>/dev/null | tr -d ' ')"
+    # 전체 물리 메모리 대비 RSS 비율. 워커 자식까지 합산한다(tree_mem_percent 주석 참고).
+    mem="$(tree_mem_percent "$pid")"
     [[ -z "$mem" ]] && mem="-"
 
     echo "[$now] PROCESS:$TARGET PID:$pid CPU:${cpu}% MEM:${mem}% DISK:${disk}% FIREWALL:$fw"
@@ -95,16 +136,31 @@ proc_cpu_percent() {
     read -r t0 c0 < <(cpu_ticks "$pid")
     sleep 1
     read -r t1 c1 < <(cpu_ticks "$pid")
+    # 두 샘플 사이에 워커 자식이 종료하면 '트리 합계 틱'이 줄어들어 음수가 나온다
+    # (2026-11-07 실측: -7.9%, -8.8%). 사용률은 음수일 수 없으므로 0 으로 깎는다.
+    # 이 구간은 '프로세스가 사라지는 중'이라 다음 샘플에서 NOT_RUNNING 으로 잡힌다.
     awk -v c0="$c0" -v c1="$c1" -v t0="$t0" -v t1="$t1" -v hz="$hz" \
-        'BEGIN { d = t1 - t0; if (d <= 0) { print "0.0"; exit } printf "%.1f", (c1 - c0) / hz / d * 100 }'
+        'BEGIN {
+             d = t1 - t0
+             if (d <= 0) { print "0.0"; exit }
+             v = (c1 - c0) / hz / d * 100
+             if (v < 0) v = 0
+             printf "%.1f", v
+         }'
 }
 
 cpu_ticks() {
     # /proc/<pid>/stat 의 14,15번째 필드 = utime, stime (클럭 틱 단위)
     # 주의: 2번째 필드(실행 파일명)에 공백이 있을 수 있으므로 ')' 뒤부터 센다.
-    local pid="$1" rest
-    rest="$(sed -e 's/^.*) //' "/proc/$pid/stat" 2>/dev/null)" || { echo "0 0"; return; }
-    awk -v now="$(date +%s.%N)" '{ print now, $12 + $13 }' <<< "$rest"
+    # 메모리와 같은 이유로 자손 프로세스의 틱까지 합산한다.
+    local pid="$1" rest p sum=0 add
+    for p in $(tree_pids "$pid"); do
+        rest="$(sed -e 's/^.*) //' "/proc/$p/stat" 2>/dev/null)" || continue
+        [[ -z "$rest" ]] && continue
+        add="$(awk '{ print $12 + $13 }' <<< "$rest")"
+        sum=$(( sum + add ))
+    done
+    echo "$(date +%s.%N) $sum"
 }
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true

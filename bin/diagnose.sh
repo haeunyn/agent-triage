@@ -17,7 +17,9 @@ set -uo pipefail
 [[ -r /etc/profile.d/agent-triage.sh ]] && . /etc/profile.d/agent-triage.sh
 TARGET="${AGENT_PROC:-fault_sim.py}"
 LOG_DIR="${AGENT_LOG_DIR:-/var/log/agent-app}"
-APP_LOG="$LOG_DIR/app.log"
+# 제공 바이너리는 agent_app.log, 연습용 시뮬레이터는 app.log 에 쓴다 (2026-11-07 실측).
+if [[ -s "$LOG_DIR/agent_app.log" ]]; then APP_LOG="$LOG_DIR/agent_app.log"
+else APP_LOG="$LOG_DIR/app.log"; fi
 CASE="${1:-all}"
 
 hr() { echo "────────────────────────────────────────────────────────"; }
@@ -54,7 +56,7 @@ case_oom() {
     tail -15 "$LOG_DIR/monitor.log" 2>/dev/null || echo "(관제 로그 없음)"
 
     sec "【OOM】 MemoryGuard 관련 로그"
-    grep -E 'MemoryGuard|SELF-TERMINATED|Memory limit' "$APP_LOG" 2>/dev/null | tail -10 \
+    grep -E 'MemoryGuard|MemoryWorker|SELF-TERMINATED|Memory limit|Cache Flushed' "$APP_LOG" 2>/dev/null | tail -10 \
         || echo "(해당 로그 없음)"
 
     local pid; pid="$(pid_of)"
@@ -76,7 +78,7 @@ case_cpu() {
     tail -15 "$LOG_DIR/monitor.log" 2>/dev/null || echo "(관제 로그 없음)"
 
     sec "【CPU】 Watchdog 관련 로그"
-    grep -E 'Watchdog|WATCHDOG|CPU occupancy' "$APP_LOG" 2>/dev/null | tail -10 \
+    grep -E 'Watchdog|WATCHDOG|CPU occupancy|CpuWorker|Threshold Violated' "$APP_LOG" 2>/dev/null | tail -10 \
         || echo "(해당 로그 없음)"
 
     sec "【CPU】 프로세스별 CPU 상위 (ps 정렬)"
